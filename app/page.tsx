@@ -159,16 +159,21 @@ export default function VisionPathApp() {
   useEffect(() => {
     if (!hasInteracted) return
 
-    // Attempt to auto-start microphone listening
-    startListening()
+    // Delay slightly so the SpeechRecognition useEffect in use-voice-engine has time to run first
+    const micTimer = setTimeout(() => {
+      startListening()
+    }, 300)
 
-    const timer = setTimeout(() => {
+    const welcomeTimer = setTimeout(() => {
       speak(
         "Welcome to Vision Path. Eyes-free indoor navigation. Say start to begin continuous environment scanning. Say help for available commands.",
         "assertive"
       )
     }, 1000)
-    return () => clearTimeout(timer)
+    return () => {
+      clearTimeout(micTimer)
+      clearTimeout(welcomeTimer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasInteracted])
 

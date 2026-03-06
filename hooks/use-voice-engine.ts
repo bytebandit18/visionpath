@@ -13,9 +13,15 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
   const [isSupported, setIsSupported] = useState(false)
   const recognitionRef = useRef<SpeechRecognition | null>(null)
 
+  // Ref to track the latest isListening state inside async closures (avoids stale closure bug)
+  const isListeningRef = useRef(false)
   const isSpeakingRef = useRef(false)
 
-  // Update onresult to ignore transcriptions while the app is talking
+  // Keep isListeningRef in sync with state
+  useEffect(() => {
+    isListeningRef.current = isListening
+  }, [isListening])
+
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (SpeechRecognition) {
@@ -41,19 +47,27 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
         }
       }
 
-      recognition.onerror = () => {
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        // On "no-speech" or "audio-capture" errors, try to restart rather than stopping
+        if (event.error === "no-speech" || event.error === "audio-capture") {
+          // Will be restarted by onend
+          return
+        }
         setIsListening(false)
+        isListeningRef.current = false
       }
 
       recognition.onend = () => {
-        if (continuous && isListening) {
+        // Use ref (not state) to avoid stale closure — this ensures continuous restarts work
+        if (continuous && isListeningRef.current) {
           try {
             recognition.start()
           } catch {
-            // Already started
+            // Already started — ignore
           }
         } else {
           setIsListening(false)
+          isListeningRef.current = false
         }
       }
 
@@ -67,18 +81,20 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
   }, [continuous])
 
   const startListening = useCallback(() => {
-    if (recognitionRef.current && !isListening) {
+    if (recognitionRef.current && !isListeningRef.current) {
       try {
         recognitionRef.current.start()
         setIsListening(true)
+        isListeningRef.current = true
       } catch {
         // Already started
       }
     }
-  }, [isListening])
+  }, [])
 
   const stopListening = useCallback(() => {
     if (recognitionRef.current) {
+      isListeningRef.current = false
       recognitionRef.current.stop()
       setIsListening(false)
     }

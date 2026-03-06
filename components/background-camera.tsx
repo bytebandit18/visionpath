@@ -20,19 +20,26 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
     const lastSpokenRef = useRef<Record<string, number>>({})
     const [videoSize, setVideoSize] = useState({ width: 0, height: 0 })
     const [facingMode, setFacingMode] = useState<"environment" | "user">("environment")
+    const [cameraError, setCameraError] = useState<string | null>(null)
 
-    // Initialize camera
+    // Initialize camera with abort signal to prevent race conditions
     useEffect(() => {
-        let stream: MediaStream | null = null
-        let isActive = true
+        if (!isNavigating) return
 
-        async function startCamera() {
-            if (!isNavigating) return
+        // AbortController lets us cancel the async camera startup if the component unmounts
+        const abortController = new AbortController()
+        const signal = abortController.signal
+        let stream: MediaStream | null = null
+
+        async function startCamera(retryCount = 0) {
+            if (signal.aborted) return
 
             try {
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                    throw new Error("getUserMedia not supported in this browser (requires HTTPS or localhost).")
+                    throw new Error("getUserMedia not supported (requires HTTPS or localhost).")
                 }
+
+                setCameraError(null)
 
                 let requestedStream: MediaStream | null = null
                 try {
@@ -40,27 +47,51 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
                         video: { facingMode: { ideal: facingMode }, width: { ideal: 640 }, height: { ideal: 480 } },
                     })
                 } catch (initialErr: any) {
-                    console.warn("Background camera initial request failed:", initialErr)
-                    if (initialErr.name === 'NotAllowedError' || initialErr.name === 'AbortError') {
-                        throw initialErr
+                    if (signal.aborted) return
+                    console.warn("Camera initial request failed:", initialErr)
+
+                    // Hard failures — don't retry
+                    if (initialErr.name === 'NotAllowedError') {
+                        setCameraError("Camera permission denied. Please grant access.")
+                        return
                     }
-                    requestedStream = await navigator.mediaDevices.getUserMedia({
-                        video: true,
-                    })
+
+                    // Soft failure — retry once with a basic constraint
+                    if (retryCount === 0) {
+                        console.log("Retrying camera with basic constraints...")
+                        await new Promise(r => setTimeout(r, 300))
+                        return startCamera(1)
+                    }
+
+                    requestedStream = await navigator.mediaDevices.getUserMedia({ video: true })
                 }
 
-                if (!isActive) {
-                    if (requestedStream) {
-                        requestedStream.getTracks().forEach((t) => t.stop())
-                    }
+                if (signal.aborted) {
+                    requestedStream?.getTracks().forEach(t => t.stop())
                     return
                 }
 
                 stream = requestedStream
+
                 if (videoRef.current && stream) {
                     videoRef.current.srcObject = stream
+
+                    // Wait for video to have data before calling play
+                    await new Promise<void>((resolve) => {
+                        if (!videoRef.current) return resolve()
+                        const onReady = () => {
+                            videoRef.current?.removeEventListener('loadedmetadata', onReady)
+                            resolve()
+                        }
+                        videoRef.current.addEventListener('loadedmetadata', onReady)
+                        // If already ready
+                        if (videoRef.current.readyState >= 1) resolve()
+                    })
+
+                    if (signal.aborted) return
+
                     try {
-                        await videoRef.current.play()
+                        await videoRef.current?.play()
                     } catch (playErr: any) {
                         if (playErr.name !== 'AbortError' && playErr.name !== 'NotAllowedError') {
                             console.warn("Camera play error (ignored):", playErr)
@@ -68,17 +99,23 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
                     }
                 }
             } catch (err: any) {
-                if (!isActive || err.name === 'AbortError') return
+                if (signal.aborted || err.name === 'AbortError') return
                 console.error("Background camera error:", err)
+                setCameraError("Camera failed to start. Please try again.")
             }
         }
 
         startCamera()
 
         return () => {
-            isActive = false
+            // Signal abortion immediately so any pending async operations bail out
+            abortController.abort()
             if (stream) {
-                stream.getTracks().forEach((t) => t.stop())
+                stream.getTracks().forEach(t => t.stop())
+            }
+            // Clear video src to prevent memory leaks
+            if (videoRef.current) {
+                videoRef.current.srcObject = null
             }
         }
     }, [isNavigating, facingMode])
@@ -86,7 +123,7 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
     const { detectedObjects } = useObjectDetection({
         isNavigating,
         videoRef,
-        invokeIntervalMs: 150, // Keep scanning fast so the UI is responsive, but let the voice cooldowns handle the spam
+        invokeIntervalMs: 150,
         speak,
         onDescribeScene: (description: string) => {
             speak(`Scene: ${description}`, "polite");
@@ -94,17 +131,13 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         onDetect: (objects: any[]) => {
             const now = Date.now()
 
-            // Filter for confident objects
             const confidentObjects = objects.filter(obj => obj.score > 0.65)
-
             if (confidentObjects.length === 0) return;
 
-            // Group objects by class
             const groups: Record<string, { count: number, closestSteps: number, latestObj: any }> = {}
 
             confidentObjects.forEach((obj) => {
                 const steps = obj.estimatedSteps || 99
-
                 if (!groups[obj.class]) {
                     groups[obj.class] = { count: 1, closestSteps: steps, latestObj: obj }
                 } else {
@@ -113,40 +146,28 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
                 }
             })
 
-            // Sort groups by distance to prioritize closer things
             const sortedGroups = Object.values(groups).sort((a, b) => a.closestSteps - b.closestSteps)
-
-            // Vehicles/hazards get priority bypassing normal cooldowns if they are close (< 15 steps)
             const hazards = ['car', 'truck', 'bus', 'motorcycle', 'wall']
 
             sortedGroups.forEach((group) => {
                 const { count, closestSteps, latestObj } = group
                 const objClass = latestObj.class
                 const isHazard = hazards.includes(objClass)
-
                 const lastSpoken = lastSpokenRef.current[objClass] || 0
 
-                // Reduced cooldowns to prioritize fast scanning & warnings, even if it "spams" a bit more
-                let cooldownMs = 12000; // Default 12 seconds
+                let cooldownMs = 12000;
                 if (isHazard) {
                     if (objClass === 'wall') {
-                        // Announce walls much faster if very close
                         cooldownMs = closestSteps < 5 ? 3000 : 10000;
                     } else {
-                        cooldownMs = closestSteps < 15 ? 4000 : 8000; // Moving hazards
+                        cooldownMs = closestSteps < 15 ? 4000 : 8000;
                     }
                 }
 
-                // If it's a completely new object we haven't seen in a while, or cooldown has passed
                 if (now - lastSpoken > cooldownMs) {
-                    const distanceStr = closestSteps < 99
-                        ? `${closestSteps} steps`
-                        : "ahead"
-
-                    // Special case for wall string formatting
+                    const distanceStr = closestSteps < 99 ? `${closestSteps} steps` : "ahead"
                     const countStr = count > 1 && objClass !== 'wall' ? `${count} ${objClass}s` : objClass
                     const hazardPrefix = isHazard ? "Caution, " : ""
-
                     let positionStr = "ahead";
                     if (latestObj.position === "left") positionStr = "on your left";
                     if (latestObj.position === "right") positionStr = "on your right";
@@ -163,15 +184,12 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
             if (!videoRef.current) return null;
             const video = videoRef.current;
             if (video.videoWidth === 0 || video.videoHeight === 0) return null;
-
             const canvas = document.createElement("canvas");
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             const ctx = canvas.getContext("2d");
             if (!ctx) return null;
-
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            // High quality JPEG for Gemini
             return canvas.toDataURL("image/jpeg", 0.9);
         }
     }));
@@ -183,10 +201,8 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         const video = videoRef.current
         const canvas = overlayRef.current
         const ctx = canvas.getContext("2d")
-
         if (!ctx) return
 
-        // Wait for video dimensions
         if (video.videoWidth === 0 || video.videoHeight === 0) {
             const handleLoadedMetadata = () => {
                 setVideoSize({ width: video.videoWidth, height: video.videoHeight })
@@ -197,30 +213,20 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
             setVideoSize({ width: video.videoWidth, height: video.videoHeight })
         }
 
-        // Set dimensions
         canvas.width = video.videoWidth
         canvas.height = video.videoHeight
-
-        // Clear previous frame
         ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-        // Draw bounding boxes
         detectedObjects.forEach((obj) => {
             if (obj.score > 0.4) {
                 const [x, y, width, height] = obj.bbox
-
-                // Draw box
-                ctx.strokeStyle = "#0ea5e9" // primary color
+                ctx.strokeStyle = "#0ea5e9"
                 ctx.lineWidth = 4
                 ctx.strokeRect(x, y, width, height)
-
-                // Draw label background
                 ctx.fillStyle = "#0ea5e9"
                 const label = `${obj.class} ${Math.round(obj.score * 100)}%`
                 const textWidth = ctx.measureText(label).width
                 ctx.fillRect(x, y - 24, textWidth + 10, 24)
-
-                // Draw text
                 ctx.fillStyle = "#ffffff"
                 ctx.font = "16px sans-serif"
                 ctx.fillText(label, x + 5, y - 6)
@@ -228,7 +234,6 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         })
     }, [detectedObjects, showLiveView, videoSize.width])
 
-    // We keep it hidden from view but mounted if showLiveView is false
     return (
         <div className={`relative ${showLiveView ? 'w-full max-w-lg aspect-[3/4] overflow-hidden rounded-2xl bg-black/10' : 'fixed -z-50 opacity-0 w-[1px] h-[1px] overflow-hidden pointer-events-none'}`}>
             <video
@@ -246,12 +251,16 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
                     aria-hidden="true"
                 />
             )}
-            {showLiveView && detectedObjects.length === 0 && (
+            {showLiveView && detectedObjects.length === 0 && !cameraError && (
                 <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/20 pointer-events-none">
                     <p className="text-white bg-black/50 px-3 py-1 rounded-full text-sm">Scanning...</p>
                 </div>
             )}
-
+            {showLiveView && cameraError && (
+                <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 pointer-events-none">
+                    <p className="text-white bg-red-600/80 px-4 py-2 rounded-full text-sm text-center">{cameraError}</p>
+                </div>
+            )}
             {showLiveView && (
                 <button
                     onClick={() => setFacingMode(prev => prev === "environment" ? "user" : "environment")}
@@ -264,4 +273,3 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         </div>
     )
 })
-
