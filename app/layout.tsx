@@ -22,6 +22,7 @@ export const metadata: Metadata = {
       {
         url: '/icon.svg',
         type: 'image/svg+xml',
+        sizes: 'any',
       },
     ],
     apple: '/apple-icon.png',

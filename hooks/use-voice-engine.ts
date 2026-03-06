@@ -12,10 +12,15 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
   const [transcript, setTranscript] = useState("")
   const [isSupported, setIsSupported] = useState(false)
   const recognitionRef = useRef<SpeechRecognition | null>(null)
+  const transcriptTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Ref to track the latest isListening state inside async closures (avoids stale closure bug)
   const isListeningRef = useRef(false)
   const isSpeakingRef = useRef(false)
+
+  // Ref to always have the latest onCommand callback (fixes stale closure in onresult)
+  const onCommandRef = useRef(onCommand)
+  useEffect(() => { onCommandRef.current = onCommand }, [onCommand])
 
   // Keep isListeningRef in sync with state
   useEffect(() => {
@@ -42,8 +47,13 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
           }
         }
         if (finalTranscript) {
-          setTranscript(finalTranscript.trim().toLowerCase())
-          onCommand?.(finalTranscript.trim().toLowerCase())
+          const processed = finalTranscript.trim().toLowerCase()
+          setTranscript(processed)
+          onCommandRef.current?.(processed)
+
+          // Auto-clear transcript after 4 seconds
+          if (transcriptTimerRef.current) clearTimeout(transcriptTimerRef.current)
+          transcriptTimerRef.current = setTimeout(() => setTranscript(""), 4000)
         }
       }
 
@@ -76,6 +86,7 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
 
     return () => {
       recognitionRef.current?.stop()
+      if (transcriptTimerRef.current) clearTimeout(transcriptTimerRef.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [continuous])
@@ -100,23 +111,39 @@ export function useVoiceEngine({ onCommand, continuous = true }: VoiceEngineOpti
     }
   }, [])
 
+  const speakTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   const speak = useCallback((text: string, priority: "polite" | "assertive" = "polite") => {
     window.speechSynthesis.cancel()
+    if (speakTimeoutRef.current) clearTimeout(speakTimeoutRef.current)
     const utterance = new SpeechSynthesisUtterance(text)
 
     // Block the microphone from processing this utterance
     utterance.onstart = () => {
       isSpeakingRef.current = true
     }
-    utterance.onend = () => {
+    const resetSpeaking = () => {
+      if (speakTimeoutRef.current) clearTimeout(speakTimeoutRef.current)
+      speakTimeoutRef.current = null
       // Small buffer to let room echoes die down
       setTimeout(() => {
         isSpeakingRef.current = false
       }, 500)
     }
+    utterance.onend = resetSpeaking
     utterance.onerror = () => {
       isSpeakingRef.current = false
     }
+
+    // Failsafe: Chrome sometimes doesn't fire onend for long utterances.
+    // Estimate ~80ms per character + 3s buffer. Reset speaking flag if stuck.
+    const estimatedMs = Math.max(4000, text.length * 80 + 3000)
+    speakTimeoutRef.current = setTimeout(() => {
+      if (isSpeakingRef.current) {
+        isSpeakingRef.current = false
+        speakTimeoutRef.current = null
+      }
+    }, estimatedMs)
 
     utterance.rate = priority === "assertive" ? 1.1 : 0.95
     utterance.pitch = 1

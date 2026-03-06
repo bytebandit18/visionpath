@@ -15,7 +15,6 @@ interface UseObjectDetectionProps {
     invokeIntervalMs?: number;
     onDetect?: (objects: DetectedObject[]) => void;
     onDescribeScene?: (description: string) => void;
-    speak?: (text: string, priority?: "polite" | "assertive") => void;
 }
 
 const AVERAGE_HEIGHTS: Record<string, number> = {
@@ -40,7 +39,7 @@ export function useObjectDetection({
 }: UseObjectDetectionProps) {
     const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
 
-    // Request gate — only one Gemini call in-flight at a time
+    // Request gate — only one API call in-flight at a time
     const isRequestInFlightRef = useRef(false);
     // How long to wait before next call (increases on rate limit)
     const nextCallDelayMs = useRef(4000);
@@ -107,6 +106,10 @@ export function useObjectDetection({
                 console.warn('[SCAN] Rate limited — backing off 30s');
                 nextCallDelayMs.current = 30000;
                 setDetectedObjects([]);
+                // Gradually recover after backoff period
+                setTimeout(() => {
+                    if (nextCallDelayMs.current > 4000) nextCallDelayMs.current = 10000;
+                }, 30000);
                 return;
             }
 
@@ -154,7 +157,10 @@ export function useObjectDetection({
             const video = videoRef.current;
             if (!video) return;
 
-            const focalLength = video.videoHeight / 1.15;
+            // Estimate focal length from video dimensions assuming ~60° vertical FOV
+            // (common for mobile phone cameras). f = h / (2 * tan(vfov/2))
+            const vfovRad = (60 * Math.PI) / 180
+            const focalLength = video.videoHeight / (2 * Math.tan(vfovRad / 2));
 
             const enhanced: DetectedObject[] = items
                 .filter((item: any) => item && item.class && Array.isArray(item.bbox) && item.bbox.length === 4)
@@ -225,6 +231,7 @@ export function useObjectDetection({
             isRequestInFlightRef.current = false;
             nextCallDelayMs.current = 4000;
             lastCallTimeRef.current = 0;
+            distanceHistoryRef.current = {};
             return;
         }
 

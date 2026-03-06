@@ -1,18 +1,13 @@
 "use client"
 
 import { Navigation, Footprints, TriangleAlert } from "lucide-react"
+import { getCardinalDirection } from "@/lib/navigation"
 
 interface SpatialCompassProps {
   heading: number
   steps: number
   isMoving: boolean
   isNavigating: boolean
-}
-
-function getCardinalDirection(heading: number): string {
-  const directions = ["North", "North East", "East", "South East", "South", "South West", "West", "North West"]
-  const index = Math.round(heading / 45) % 8
-  return directions[index]
 }
 
 export function SpatialCompass({ heading, steps, isMoving, isNavigating }: SpatialCompassProps) {
@@ -28,7 +23,7 @@ export function SpatialCompass({ heading, steps, isMoving, isNavigating }: Spati
       <div className="relative flex h-48 w-48 items-center justify-center rounded-full border-4 border-border bg-card">
         <div
           className="absolute inset-4 flex items-center justify-center rounded-full border-2 border-muted"
-          style={{ transform: `rotate(${heading}deg)` }}
+          style={{ transform: `rotate(-${heading}deg)` }}
         >
           <Navigation
             className={`h-16 w-16 transition-colors ${isNavigating ? "text-primary" : "text-muted-foreground"}`}

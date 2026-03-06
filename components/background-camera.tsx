@@ -14,11 +14,11 @@ interface BackgroundCameraProps {
     showLiveView?: boolean
 }
 
-export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCameraProps>(({ isNavigating, speak, showLiveView = false }, ref) => {
+const BackgroundCameraInner = forwardRef<BackgroundCameraHandle, BackgroundCameraProps>(({ isNavigating, speak, showLiveView = false }, ref) => {
     const videoRef = useRef<HTMLVideoElement>(null)
     const overlayRef = useRef<HTMLCanvasElement>(null)
     const lastSpokenRef = useRef<Record<string, number>>({})
-    const [videoSize, setVideoSize] = useState({ width: 0, height: 0 })
+    const videoSizeRef = useRef({ width: 0, height: 0 })
     const [facingMode, setFacingMode] = useState<"environment" | "user">("environment")
     const [cameraError, setCameraError] = useState<string | null>(null)
 
@@ -93,7 +93,9 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
                     try {
                         await videoRef.current?.play()
                     } catch (playErr: any) {
-                        if (playErr.name !== 'AbortError' && playErr.name !== 'NotAllowedError') {
+                        if (playErr.name === 'NotAllowedError') {
+                            setCameraError("Autoplay blocked. Tap the screen to allow camera playback.")
+                        } else if (playErr.name !== 'AbortError') {
                             console.warn("Camera play error (ignored):", playErr)
                         }
                     }
@@ -123,13 +125,19 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
     const { detectedObjects } = useObjectDetection({
         isNavigating,
         videoRef,
-        invokeIntervalMs: 150,
-        speak,
+        invokeIntervalMs: 1000,
         onDescribeScene: (description: string) => {
             speak(`Scene: ${description}`, "polite");
         },
         onDetect: (objects: any[]) => {
             const now = Date.now()
+
+            // Prune stale entries older than 60 seconds to prevent memory growth
+            for (const key in lastSpokenRef.current) {
+                if (now - lastSpokenRef.current[key] > 60000) {
+                    delete lastSpokenRef.current[key]
+                }
+            }
 
             const confidentObjects = objects.filter(obj => obj.score > 0.65)
             if (confidentObjects.length === 0) return;
@@ -179,12 +187,15 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         },
     })
 
+    const captureCanvasRef = useRef<HTMLCanvasElement | null>(null)
+
     useImperativeHandle(ref, () => ({
         captureFrame: () => {
             if (!videoRef.current) return null;
             const video = videoRef.current;
             if (video.videoWidth === 0 || video.videoHeight === 0) return null;
-            const canvas = document.createElement("canvas");
+            if (!captureCanvasRef.current) captureCanvasRef.current = document.createElement("canvas");
+            const canvas = captureCanvasRef.current;
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             const ctx = canvas.getContext("2d");
@@ -205,34 +216,61 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
 
         if (video.videoWidth === 0 || video.videoHeight === 0) {
             const handleLoadedMetadata = () => {
-                setVideoSize({ width: video.videoWidth, height: video.videoHeight })
+                videoSizeRef.current = { width: video.videoWidth, height: video.videoHeight }
             }
             video.addEventListener('loadedmetadata', handleLoadedMetadata)
             return () => video.removeEventListener('loadedmetadata', handleLoadedMetadata)
-        } else if (videoSize.width !== video.videoWidth) {
-            setVideoSize({ width: video.videoWidth, height: video.videoHeight })
         }
 
-        canvas.width = video.videoWidth
-        canvas.height = video.videoHeight
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        videoSizeRef.current = { width: video.videoWidth, height: video.videoHeight }
+
+        // Match canvas resolution to container display size so bounding boxes align
+        const container = canvas.parentElement
+        if (!container) return
+        const displayW = container.clientWidth
+        const displayH = container.clientHeight
+        canvas.width = displayW
+        canvas.height = displayH
+        ctx.clearRect(0, 0, displayW, displayH)
+
+        // Compute the same object-cover scaling the <video> uses
+        const videoAR = video.videoWidth / video.videoHeight
+        const containerAR = displayW / displayH
+        let scaleX: number, scaleY: number, offsetX: number, offsetY: number
+        if (videoAR > containerAR) {
+            // Video wider than container — cropped left/right
+            scaleY = displayH / video.videoHeight
+            scaleX = scaleY
+            offsetX = (displayW - video.videoWidth * scaleX) / 2
+            offsetY = 0
+        } else {
+            // Video taller — cropped top/bottom
+            scaleX = displayW / video.videoWidth
+            scaleY = scaleX
+            offsetX = 0
+            offsetY = (displayH - video.videoHeight * scaleY) / 2
+        }
 
         detectedObjects.forEach((obj) => {
             if (obj.score > 0.4) {
                 const [x, y, width, height] = obj.bbox
+                const dx = x * scaleX + offsetX
+                const dy = y * scaleY + offsetY
+                const dw = width * scaleX
+                const dh = height * scaleY
                 ctx.strokeStyle = "#0ea5e9"
-                ctx.lineWidth = 4
-                ctx.strokeRect(x, y, width, height)
+                ctx.lineWidth = 3
+                ctx.strokeRect(dx, dy, dw, dh)
                 ctx.fillStyle = "#0ea5e9"
+                ctx.font = "14px sans-serif"
                 const label = `${obj.class} ${Math.round(obj.score * 100)}%`
                 const textWidth = ctx.measureText(label).width
-                ctx.fillRect(x, y - 24, textWidth + 10, 24)
+                ctx.fillRect(dx, dy - 22, textWidth + 8, 22)
                 ctx.fillStyle = "#ffffff"
-                ctx.font = "16px sans-serif"
-                ctx.fillText(label, x + 5, y - 6)
+                ctx.fillText(label, dx + 4, dy - 5)
             }
         })
-    }, [detectedObjects, showLiveView, videoSize.width])
+    }, [detectedObjects, showLiveView])
 
     return (
         <div className={`relative ${showLiveView ? 'w-full max-w-lg aspect-[3/4] overflow-hidden rounded-2xl bg-black/10' : 'fixed -z-50 opacity-0 w-[1px] h-[1px] overflow-hidden pointer-events-none'}`}>
@@ -247,7 +285,7 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
             {showLiveView && (
                 <canvas
                     ref={overlayRef}
-                    className="absolute inset-0 h-full w-full object-cover z-10"
+                    className="absolute inset-0 h-full w-full z-10"
                     aria-hidden="true"
                 />
             )}
@@ -273,3 +311,7 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
         </div>
     )
 })
+
+BackgroundCameraInner.displayName = "BackgroundCamera"
+
+export const BackgroundCamera = BackgroundCameraInner
