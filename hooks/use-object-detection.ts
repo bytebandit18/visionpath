@@ -13,6 +13,7 @@ interface UseObjectDetectionProps {
     invokeIntervalMs?: number;
     onDetect?: (objects: DetectedObject[]) => void;
     onDescribeScene?: (description: string) => void;
+    speak?: (text: string, priority?: "polite" | "assertive") => void;
 }
 
 export function useObjectDetection({
@@ -21,10 +22,14 @@ export function useObjectDetection({
     invokeIntervalMs = 500,
     onDetect,
     onDescribeScene,
+    speak
 }: UseObjectDetectionProps) {
     const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
     const isProcessingRef = useRef(false);
+    const isGeminiProcessingRef = useRef(false);
+    const latestGeminiPredictionsRef = useRef<any[]>([]);
     const lastDescriptionTimeRef = useRef(0);
+    const lastSpokeRateLimitRef = useRef(0);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const distanceHistoryRef = useRef<Record<string, number[]>>({});
     const onDetectRef = useRef(onDetect);
@@ -45,7 +50,7 @@ export function useObjectDetection({
         }
     }, []);
 
-    const processFrame = useCallback(async () => {
+    const processFrame = useCallback(() => {
         if (!isNavigating || !videoRef.current || isProcessingRef.current) return;
 
         const video = videoRef.current;
@@ -71,8 +76,9 @@ export function useObjectDetection({
 
             ctx.drawImage(video, 0, 0, drawWidth, drawHeight);
 
-            // Fetch generic AI scene description every 10 seconds (if user callback provided)
-            if (onDescribeSceneRef.current && (now - lastDescriptionTimeRef.current > 10000)) {
+            // Fetch generic AI scene description every 25 seconds (if user callback provided)
+            // Increased to 25 seconds to prevent hitting the 15 RPM overall limit
+            if (onDescribeSceneRef.current && (now - lastDescriptionTimeRef.current > 25000)) {
                 lastDescriptionTimeRef.current = now;
                 // Run describe in background so it doesn't block the fast object detection loop
                 const bgImage = canvas.toDataURL('image/jpeg', 0.6);
@@ -83,13 +89,17 @@ export function useObjectDetection({
                 })
                     .then(res => res.json())
                     .then(data => {
+                        if (data.error) {
+                            console.warn("Scene description API Error:", data.error);
+                            return;
+                        }
                         if (data.result && data.result !== "Nothing clear detected.") {
                             if (onDescribeSceneRef.current) {
                                 onDescribeSceneRef.current(data.result);
                             }
                         }
                     })
-                    .catch(err => console.error("Scene description failed", err));
+                    .catch(err => console.warn("Scene description failed:", String(err)));
             }
 
             // Wall detection heuristic (using the downscaled image)
@@ -144,54 +154,113 @@ export function useObjectDetection({
                 console.error("Variance check failed", err)
             }
 
-            // AI Vision Object Detection via Gemini Proxy
-            const backendUrl = `/api/describe`;
-            const base64Image = canvas.toDataURL('image/jpeg', 0.6); // Reduced quality for speed
+            // AI Vision Object Detection via Gemini Proxy (Async background task)
+            if (!isGeminiProcessingRef.current) {
+                console.log("[SCAN] Starting new Gemini request...");
+                isGeminiProcessingRef.current = true;
+                const backendUrl = `/api/describe`;
+                const base64Image = canvas.toDataURL('image/jpeg', 0.6); // Reduced quality for speed
 
-            let predictions: any[] = [];
+                let hasRateLimitError = false;
 
-            try {
-                const response = await fetch(backendUrl, {
+                fetch(backendUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image: base64Image })
-                });
+                    body: JSON.stringify({ image: base64Image, mode: 'detect' })
+                })
+                    .then(response => {
+                        console.log("[SCAN] Received response status:", response.status);
+                        if (response.status === 429) {
+                            hasRateLimitError = true;
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        if (data.error) {
+                            console.warn("AI Backend Error:", data.error, data.details);
+                            const errorStr = String(data.error).toLowerCase();
+                            const detailsStr = String(data.details).toLowerCase();
 
-                if (response.ok) {
-                    const data = await response.json();
-                    const textResult = data.result || "";
+                            if (errorStr.includes("quota") || detailsStr.includes("quota") ||
+                                errorStr.includes("429") || detailsStr.includes("429") ||
+                                errorStr.includes("rate limit") || hasRateLimitError) {
+                                hasRateLimitError = true;
+                                if (now - lastSpokeRateLimitRef.current > 60000) {
+                                    // Removed voice alert for wait limit exceeded per user request
+                                    lastSpokeRateLimitRef.current = now;
+                                }
+                            }
 
-                    if (textResult && textResult !== "Nothing clear detected." && !textResult.includes("Error")) {
-                        // Gemini returns a comma separated list. 
-                        // Synthesize fake bounding boxes so the existing distance tracking works
-                        const items = textResult.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0);
+                            // Clear predictions so the UI doesn't freeze with stale boxes
+                            latestGeminiPredictionsRef.current = [];
+                            return; // Stop processing if backend returned an error
+                        }
 
-                        predictions = items.map((item: string, index: number) => {
-                            // Distribute items across the screen horizontally
-                            const stepX = video.videoWidth / (items.length + 1);
-                            const centerX = stepX * (index + 1);
+                        const rawResult = data.result || "";
+                        console.log("[SCAN] Raw AI Result:", rawResult.substring(0, 100) + "...");
 
-                            // AI doesn't give us exact boxes, so we create a reasonable default box in the center
-                            const defaultWidth = video.videoWidth * 0.4;
-                            const defaultHeight = video.videoHeight * 0.4;
-                            const startXBox = centerX - (defaultWidth / 2);
-                            const startYBox = (video.videoHeight / 2) - (defaultHeight / 2);
+                        if (rawResult && rawResult !== "Nothing clear detected." && !rawResult.includes("Error")) {
+                            try {
+                                // Extract JSON if wrapped in markdown
+                                let jsonStr = rawResult;
+                                const match = rawResult.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+                                if (match) {
+                                    jsonStr = match[1];
+                                }
 
-                            return {
-                                class: item.toLowerCase(),
-                                score: 0.9, // High confidence since it's from Gemini
-                                bbox: [startXBox, startYBox, defaultWidth, defaultHeight]
-                            };
-                        });
-                    }
-                }
-            } catch (backendErr) {
-                console.error("AI Vision request failed:", backendErr);
+                                const items = JSON.parse(jsonStr);
+                                console.log("[SCAN] Parsed AI Items:", items.length);
+
+                                if (Array.isArray(items)) {
+                                    latestGeminiPredictionsRef.current = items.map((item: any) => {
+                                        // item.bbox is [ymin, xmin, ymax, xmax] normalized 0 to 1000
+                                        const ymin = (item.bbox[0] / 1000) * video.videoHeight;
+                                        const xmin = (item.bbox[1] / 1000) * video.videoWidth;
+                                        const ymax = (item.bbox[2] / 1000) * video.videoHeight;
+                                        const xmax = (item.bbox[3] / 1000) * video.videoWidth;
+
+                                        return {
+                                            class: item.class ? item.class.toLowerCase() : 'unknown',
+                                            score: item.score || 0.9,
+                                            bbox: [xmin, ymin, xmax - xmin, ymax - ymin]
+                                        };
+                                    });
+                                }
+                            } catch (e) {
+                                console.warn("Failed to parse Gemini detect JSON:", e, rawResult);
+                            }
+                        }
+                    })
+                    .catch(backendErr => {
+                        // Keep error silently logged as string to avoid Next.js dev overlay intercepting the Error object
+                        const errorString = String(backendErr);
+                        console.warn("AI Vision request failed:", errorString);
+                        // Do not lock onto old predictions if the API is failing
+                        latestGeminiPredictionsRef.current = [];
+                        hasRateLimitError = true;
+                    })
+                    .finally(() => {
+                        // Use a much longer timeout if we hit a rate limit to allow the quota to reset
+                        const delayMs = hasRateLimitError ? 30000 : 6000;
+                        console.log(`[SCAN] Request finished. Waiting ${delayMs / 1000}s before next allowed scan.`);
+
+                        setTimeout(() => {
+                            console.log("[SCAN] Ready for next scan.");
+                            isGeminiProcessingRef.current = false;
+                        }, delayMs);
+                    });
+            }
+
+            // Always use the latest available predictions for the frame processing
+            let predictions: any[] = [];
+            if (Array.isArray(latestGeminiPredictionsRef.current)) {
+                predictions = [...latestGeminiPredictionsRef.current];
             }
 
             // Estimate distances (Since we synthesize boxes, we rely heavily on the wall heuristic or default sizes)
             const AVERAGE_HEIGHTS: Record<string, number> = {
-                person: 1.7, chair: 0.9, table: 0.8, desk: 0.8, 'wooden table': 0.8,
+                person: 1.7, man: 1.7, woman: 1.6, boy: 1.4, girl: 1.3, human: 1.6,
+                chair: 0.9, table: 0.8, desk: 0.8, 'wooden table': 0.8,
                 sofa: 0.9, couch: 0.9, bed: 0.6, door: 2.0, window: 1.5,
                 laptop: 0.2, computer: 0.4, monitor: 0.4, tv: 0.6, television: 0.6,
                 speaker: 0.3, socket: 0.1, 'power socket': 0.1, switch: 0.1,
@@ -204,13 +273,17 @@ export function useObjectDetection({
                 wall: 2.5, floor: 0.0, ceiling: 3.0
             };
 
-            const focalLength = (video.videoHeight / 2) / 0.466;
+            // Standard mobile camera focal length approximation (often ~0.8 to 1.0 depending on field of view)
+            // A more standard 60-degree vertical FOV gives f = height / (2 * tan(30deg)) = height / 1.15
+            const focalLength = video.videoHeight / 1.15;
 
             const enhancedPredictions = predictions.map((pred: any) => {
+                if (!pred || !pred.bbox || pred.bbox.length !== 4) return null; // Safe check for malformed bbox array
+
                 const [x, , width, height] = pred.bbox;
 
-                // Try to find a matching height key, or default to 0.5m
-                let realHeight = 0.5;
+                // Try to find a matching height key, or default to 0.4m (typical small object)
+                let realHeight = 0.4;
                 for (const key in AVERAGE_HEIGHTS) {
                     if (pred.class.includes(key)) {
                         realHeight = AVERAGE_HEIGHTS[key];
@@ -218,9 +291,11 @@ export function useObjectDetection({
                     }
                 }
 
+                // Distance = (Real Height * Focal Length) / Pixel Height
                 const estimatedDistanceMeters = (realHeight * focalLength) / height;
 
-                let rawSteps = Math.max(1, Math.round(estimatedDistanceMeters / 0.76));
+                // 1 step is approximately 0.762 meters (30 inches)
+                let rawSteps = Math.max(1, Math.round(estimatedDistanceMeters / 0.762));
                 rawSteps = Math.min(rawSteps, 30);
 
                 if (!distanceHistoryRef.current[pred.class]) {
@@ -238,9 +313,9 @@ export function useObjectDetection({
                 const centerX = x + (width / 2);
                 let position: "left" | "right" | "center" = "center";
                 if (centerX < video.videoWidth / 3) {
-                    position = "right";
+                    position = "left"; // If it's on the left side of the screen/camera, it's left from the user's perspective
                 } else if (centerX > video.videoWidth * (2 / 3)) {
-                    position = "left";
+                    position = "right"; // If it's on the right side of the screen/camera, it's right
                 }
 
                 return {
@@ -249,7 +324,15 @@ export function useObjectDetection({
                     estimatedSteps: smoothedSteps,
                     position
                 };
-            });
+            }).filter((pred: any) => {
+                if (!pred) return false;
+                const lowerClass = pred.class.toLowerCase();
+                // Ignore lights and ceilings
+                if (lowerClass.includes('light') || lowerClass.includes('lamp') || lowerClass.includes('bulb') || lowerClass.includes('ceiling')) {
+                    return false;
+                }
+                return true;
+            }); // Filter out any nulls or lights
 
             if (wallPrediction) {
                 if (enhancedPredictions.length < 5) {
@@ -265,17 +348,16 @@ export function useObjectDetection({
         } catch (error) {
             console.error('Error in object detection loop:', error);
         } finally {
-            // Because Gemini is slower than COCO-SSD, we add a forced delay before processing the next frame
-            // This prevents building up a massive backlog of concurrent API calls.
-            setTimeout(() => {
-                isProcessingRef.current = false;
-            }, 1000);
+            // Fast loop reset. Gemini API rate limiting is handled by isGeminiProcessingRef.
+            isProcessingRef.current = false;
         }
     }, [isNavigating, videoRef]);
 
     useEffect(() => {
         if (!isNavigating) {
             setDetectedObjects([]);
+            latestGeminiPredictionsRef.current = [];
+            isGeminiProcessingRef.current = false;
             return;
         }
 

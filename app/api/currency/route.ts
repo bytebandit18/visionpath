@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
+import { retryWithBackoff } from "../../../lib/retry";
 
 // Move instantiation down so Next.js doesn't crash on boot if the key is missing
 
@@ -28,7 +29,7 @@ Examples of valid responses: "One Rupee Coin", "Two Rupee Coin", "Five Rupee Coi
 If you do not see any currency, or if it is too blurry to identify, respond ONLY with "No currency detected."
 `;
 
-        const response = await ai.models.generateContent({
+        const response = await retryWithBackoff(() => ai.models.generateContent({
             model: "gemini-2.5-flash",
             contents: [
                 prompt,
@@ -39,13 +40,17 @@ If you do not see any currency, or if it is too blurry to identify, respond ONLY
                     }
                 }
             ]
-        });
+        }), Number(process.env.RETRY_ATTEMPTS || 6), Number(process.env.RETRY_BASE_DELAY || 1000));
 
-        const text = response.text || "No currency detected.";
+        const text = (response as any).text || "No currency detected.";
 
         return NextResponse.json({ result: text });
-    } catch (error) {
+    } catch (error: any) {
         console.error("Error detecting currency:", error);
+        const errMsg = String(error?.message || error || '');
+        if (/rate limit|quota|429/i.test(errMsg) || error?.status === 429) {
+            return NextResponse.json({ error: "Rate limit or quota exceeded", details: errMsg }, { status: 429 });
+        }
         return NextResponse.json({ error: "Failed to detect currency" }, { status: 500 });
     }
 }

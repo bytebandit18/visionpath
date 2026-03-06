@@ -86,14 +86,15 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
     const { detectedObjects } = useObjectDetection({
         isNavigating,
         videoRef,
-        invokeIntervalMs: 150,
+        invokeIntervalMs: 150, // Keep scanning fast so the UI is responsive, but let the voice cooldowns handle the spam
+        speak,
         onDescribeScene: (description: string) => {
             speak(`Scene: ${description}`, "polite");
         },
         onDetect: (objects: any[]) => {
             const now = Date.now()
 
-            // Filter for confident objects, increased threshold to 0.65 to prevent false positives
+            // Filter for confident objects
             const confidentObjects = objects.filter(obj => obj.score > 0.65)
 
             if (confidentObjects.length === 0) return;
@@ -115,7 +116,7 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
             // Sort groups by distance to prioritize closer things
             const sortedGroups = Object.values(groups).sort((a, b) => a.closestSteps - b.closestSteps)
 
-            // Vehicles/hazards get priority bypassing normal cooldowns if they are close (< 15 steps) // including walls
+            // Vehicles/hazards get priority bypassing normal cooldowns if they are close (< 15 steps)
             const hazards = ['car', 'truck', 'bus', 'motorcycle', 'wall']
 
             sortedGroups.forEach((group) => {
@@ -125,14 +126,14 @@ export const BackgroundCamera = forwardRef<BackgroundCameraHandle, BackgroundCam
 
                 const lastSpoken = lastSpokenRef.current[objClass] || 0
 
-                // Increase cooldowns to reduce voice spamming
+                // Reduced cooldowns to prioritize fast scanning & warnings, even if it "spams" a bit more
                 let cooldownMs = 12000; // Default 12 seconds
                 if (isHazard) {
                     if (objClass === 'wall') {
                         // Announce walls much faster if very close
-                        cooldownMs = closestSteps < 5 ? 3000 : 12000;
+                        cooldownMs = closestSteps < 5 ? 3000 : 10000;
                     } else {
-                        cooldownMs = closestSteps < 15 ? 4000 : 10000; // Moving hazards
+                        cooldownMs = closestSteps < 15 ? 4000 : 8000; // Moving hazards
                     }
                 }
 
