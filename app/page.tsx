@@ -11,7 +11,7 @@ import { BackgroundCamera, BackgroundCameraHandle } from "@/components/backgroun
 type AppScreen = "home" | "navigate" | "emergency"
 
 const VOICE_COMMANDS = [
-  { command: "allow / grant", description: "Grant camera permissions" },
+  { command: "allow / grant / give access", description: "Grant camera & microphone permissions" },
   { command: "start", description: "Begin navigation" },
   { command: "stop", description: "Stop current navigation" },
   { command: "show feed / hide feed", description: "Toggle live camera view" },
@@ -81,11 +81,17 @@ export default function VisionPathApp() {
       } else if (cmd.includes("hide feed") || cmd.includes("hide camera")) {
         setShowLiveCamera(false)
         speak("Live camera feed hidden.", "polite")
-      } else if (cmd.includes("allow") || cmd.includes("grant") || cmd.includes("permission")) {
-        if (screen === "home") {
-          speak("Requesting permissions.", "polite")
-          setTriggerPermissionRequest(true)
-        }
+      } else if (
+        cmd.includes("allow") || cmd.includes("grant") ||
+        cmd.includes("permission") || cmd.includes("permit") ||
+        cmd.includes("enable camera") || cmd.includes("open camera") ||
+        cmd.includes("enable microphone") || cmd.includes("enable mic") ||
+        cmd.includes("give access") || cmd.includes("access camera") ||
+        cmd.includes("camera access") || cmd.includes("mic access") ||
+        (cmd.includes("yes") && cmd.includes("camera"))
+      ) {
+        speak("Requesting camera and microphone access. Please tap Allow when prompted.", "assertive")
+        setTriggerPermissionRequest(true)
       } else if (cmd.includes("back") || cmd.includes("retrace") || cmd.includes("return")) {
         speak(
           `Retracing path. You have ${breadcrumbs.length} breadcrumbs recorded. Turn around and follow audio cues.`,
