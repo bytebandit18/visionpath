@@ -93,25 +93,14 @@ export function useObjectDetection({
         isRequestInFlightRef.current = true;
         lastCallTimeRef.current = now;
 
-        console.log('[SCAN] Sending frame to /api/describe (detect mode)...');
+        console.log('[SCAN] Sending frame to local backend /detect...');
 
         try {
-            const res = await fetch('/api/describe', {
+            const res = await fetch('http://127.0.0.1:5001/detect', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ image: base64Image, mode: 'detect' }),
+                body: JSON.stringify({ image: base64Image }),
             });
-
-            if (res.status === 429) {
-                console.warn('[SCAN] Rate limited — backing off 30s');
-                nextCallDelayMs.current = 30000;
-                setDetectedObjects([]);
-                // Gradually recover after backoff period
-                setTimeout(() => {
-                    if (nextCallDelayMs.current > 4000) nextCallDelayMs.current = 10000;
-                }, 30000);
-                return;
-            }
 
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({}));
@@ -121,35 +110,12 @@ export function useObjectDetection({
             }
 
             const data = await res.json();
-            console.log('[SCAN] Raw response:', String(data.result || '').substring(0, 120));
 
             // Reset delay on success
             nextCallDelayMs.current = 4000;
 
-            const rawResult: string = data.result || '';
-            if (!rawResult || rawResult.toLowerCase().includes('nothing clear')) {
-                setDetectedObjects([]);
-                return;
-            }
-
-            // Parse JSON — strip any markdown code fences if present
-            let jsonStr = rawResult.trim();
-            const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-            if (fenceMatch) jsonStr = fenceMatch[1].trim();
-
-            // Find the first '[' in case there's prefix text
-            const arrayStart = jsonStr.indexOf('[');
-            if (arrayStart > 0) jsonStr = jsonStr.slice(arrayStart);
-
-            let items: any[] = [];
-            try {
-                items = JSON.parse(jsonStr);
-            } catch (e) {
-                console.warn('[SCAN] Failed to parse JSON:', e, jsonStr.substring(0, 200));
-                return;
-            }
-
-            if (!Array.isArray(items) || items.length === 0) {
+            const items: any[] = data.objects || [];
+            if (items.length === 0) {
                 setDetectedObjects([]);
                 return;
             }
@@ -158,8 +124,7 @@ export function useObjectDetection({
             if (!video) return;
 
             // Estimate focal length from video dimensions assuming ~60° vertical FOV
-            // (common for mobile phone cameras). f = h / (2 * tan(vfov/2))
-            const vfovRad = (60 * Math.PI) / 180
+            const vfovRad = (60 * Math.PI) / 180;
             const focalLength = video.videoHeight / (2 * Math.tan(vfovRad / 2));
 
             const enhanced: DetectedObject[] = items
@@ -170,14 +135,11 @@ export function useObjectDetection({
                     // Skip lights/ceiling items
                     if (/light|lamp|bulb|ceiling|fixture/i.test(label)) return null;
 
-                    // bbox from API: [ymin, xmin, ymax, xmax] normalized 0-1000
-                    const ymin = (item.bbox[0] / 1000) * video.videoHeight;
-                    const xmin = (item.bbox[1] / 1000) * video.videoWidth;
-                    const ymax = (item.bbox[2] / 1000) * video.videoHeight;
-                    const xmax = (item.bbox[3] / 1000) * video.videoWidth;
-
-                    const bboxWidth = xmax - xmin;
-                    const bboxHeight = ymax - ymin;
+                    // bbox from COCO-SSD: [x, y, width, height] in pixels
+                    const xmin = item.bbox[0];
+                    const ymin = item.bbox[1];
+                    const bboxWidth = item.bbox[2];
+                    const bboxHeight = item.bbox[3];
 
                     // Estimate distance
                     let realHeight = 0.4;
@@ -186,7 +148,7 @@ export function useObjectDetection({
                     }
 
                     const distanceM = bboxHeight > 0 ? (realHeight * focalLength) / bboxHeight : 99;
-                    let rawSteps = Math.min(30, Math.max(1, Math.round(distanceM / 0.762)));
+                    const rawSteps = Math.min(30, Math.max(1, Math.round(distanceM / 0.762)));
 
                     if (!distanceHistoryRef.current[label]) distanceHistoryRef.current[label] = [];
                     const history = distanceHistoryRef.current[label];
