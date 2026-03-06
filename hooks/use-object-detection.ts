@@ -5,6 +5,8 @@ export interface DetectedObject {
     score: number;
     bbox: [number, number, number, number];
     position?: "left" | "right" | "center";
+    estimatedDistanceMeters?: number;
+    estimatedSteps?: number;
 }
 
 interface UseObjectDetectionProps {
@@ -16,363 +18,220 @@ interface UseObjectDetectionProps {
     speak?: (text: string, priority?: "polite" | "assertive") => void;
 }
 
+const AVERAGE_HEIGHTS: Record<string, number> = {
+    person: 1.7, man: 1.7, woman: 1.6, boy: 1.4, girl: 1.3, human: 1.6,
+    chair: 0.9, table: 0.8, desk: 0.8,
+    sofa: 0.9, couch: 0.9, bed: 0.6, door: 2.0, window: 1.5,
+    laptop: 0.2, computer: 0.4, monitor: 0.4, tv: 0.6, television: 0.6,
+    speaker: 0.3, socket: 0.1, 'power socket': 0.1, switch: 0.1,
+    phone: 0.15, 'cell phone': 0.15, mobile: 0.15, bottle: 0.25,
+    cup: 0.1, glass: 0.15, mug: 0.1,
+    car: 1.5, truck: 3.5, bus: 3.0, motorcycle: 1.2, bicycle: 1.0,
+    tree: 3.0, plant: 0.5, bag: 0.5, backpack: 0.5, box: 0.4,
+    cat: 0.3, dog: 0.6, wall: 2.5,
+};
+
 export function useObjectDetection({
     isNavigating,
     videoRef,
     invokeIntervalMs = 500,
     onDetect,
     onDescribeScene,
-    speak
 }: UseObjectDetectionProps) {
     const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
-    const isProcessingRef = useRef(false);
-    const isGeminiProcessingRef = useRef(false);
-    const latestGeminiPredictionsRef = useRef<any[]>([]);
-    const lastDescriptionTimeRef = useRef(0);
-    const lastSpokeRateLimitRef = useRef(0);
+
+    // Request gate — only one Gemini call in-flight at a time
+    const isRequestInFlightRef = useRef(false);
+    // How long to wait before next call (increases on rate limit)
+    const nextCallDelayMs = useRef(4000);
+    const lastCallTimeRef = useRef(0);
+
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
-    const distanceHistoryRef = useRef<Record<string, number[]>>({});
     const onDetectRef = useRef(onDetect);
     const onDescribeSceneRef = useRef(onDescribeScene);
+    const distanceHistoryRef = useRef<Record<string, number[]>>({});
+
+    useEffect(() => { onDetectRef.current = onDetect; }, [onDetect]);
+    useEffect(() => { onDescribeSceneRef.current = onDescribeScene; }, [onDescribeScene]);
 
     useEffect(() => {
-        onDetectRef.current = onDetect;
-    }, [onDetect]);
-
-    useEffect(() => {
-        onDescribeSceneRef.current = onDescribeScene;
-    }, [onDescribeScene]);
-
-    useEffect(() => {
-        // Create an off-screen canvas if it doesn't exist
         if (!canvasRef.current) {
             canvasRef.current = document.createElement('canvas');
         }
     }, []);
 
-    const processFrame = useCallback(async () => {
-        if (!isNavigating || !videoRef.current || isProcessingRef.current) return;
-
+    const captureFrameBase64 = useCallback((): string | null => {
         const video = videoRef.current;
+        if (!video || video.readyState < 2 || video.videoWidth === 0) return null;
 
-        // Wait for video to be ready — retry up to 10 times with 200ms gaps instead of silently bailing
-        if (video.readyState < 2 || video.videoWidth === 0) {
-            console.log('[SCAN] Video not ready yet (readyState:', video.readyState, ') — waiting...');
+        const canvas = canvasRef.current;
+        if (!canvas) return null;
+
+        // Scale down for faster encoding and lower API payload
+        const scale = Math.min(1, 480 / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.floor(video.videoWidth * scale);
+        canvas.height = Math.floor(video.videoHeight * scale);
+
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return null;
+
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL('image/jpeg', 0.7);
+    }, [videoRef]);
+
+    const runDetection = useCallback(async () => {
+        if (!isNavigating || isRequestInFlightRef.current) return;
+
+        const now = Date.now();
+        if (now - lastCallTimeRef.current < nextCallDelayMs.current) return;
+
+        const base64Image = captureFrameBase64();
+        if (!base64Image) {
+            console.log('[SCAN] Frame not ready yet, skipping...');
             return;
         }
 
-        isProcessingRef.current = true;
-        const now = Date.now();
+        isRequestInFlightRef.current = true;
+        lastCallTimeRef.current = now;
+
+        console.log('[SCAN] Sending frame to /api/describe (detect mode)...');
 
         try {
-            const canvas = canvasRef.current;
-            if (!canvas) return;
+            const res = await fetch('/api/describe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ image: base64Image, mode: 'detect' }),
+            });
 
-            // Downscale image to speed up drawing, base64 encoding and network transfer
-            const scale = Math.min(1, 320 / video.videoWidth);
-            const drawWidth = Math.floor(video.videoWidth * scale);
-            const drawHeight = Math.floor(video.videoHeight * scale);
-
-            canvas.width = drawWidth;
-            canvas.height = drawHeight;
-
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            if (!ctx) return;
-
-            ctx.drawImage(video, 0, 0, drawWidth, drawHeight);
-
-            // Fetch generic AI scene description every 25 seconds (if user callback provided)
-            // Increased to 25 seconds to prevent hitting the 15 RPM overall limit
-            if (onDescribeSceneRef.current && (now - lastDescriptionTimeRef.current > 25000)) {
-                lastDescriptionTimeRef.current = now;
-                // Run describe in background so it doesn't block the fast object detection loop
-                const bgImage = canvas.toDataURL('image/jpeg', 0.6);
-                fetch('/api/describe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image: bgImage })
-                })
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.error) {
-                            console.warn("Scene description API Error:", data.error);
-                            return;
-                        }
-                        if (data.result && data.result !== "Nothing clear detected.") {
-                            if (onDescribeSceneRef.current) {
-                                onDescribeSceneRef.current(data.result);
-                            }
-                        }
-                    })
-                    .catch(err => console.warn("Scene description failed:", String(err)));
+            if (res.status === 429) {
+                console.warn('[SCAN] Rate limited — backing off 30s');
+                nextCallDelayMs.current = 30000;
+                setDetectedObjects([]);
+                return;
             }
 
-            // Wall detection heuristic (using the downscaled image)
-            // We sample a box in the center of the bottom third of the frame
-            const boxWidth = Math.floor(drawWidth / 3);
-            const boxHeight = Math.floor(drawHeight / 3);
-            const startX = Math.floor((drawWidth / 2) - (boxWidth / 2));
-            const startY = Math.floor(drawHeight * 0.6); // bottom part
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({}));
+                console.error('[SCAN] API error:', res.status, errData);
+                nextCallDelayMs.current = 6000;
+                return;
+            }
 
-            let wallPrediction = null;
+            const data = await res.json();
+            console.log('[SCAN] Raw response:', String(data.result || '').substring(0, 120));
 
+            // Reset delay on success
+            nextCallDelayMs.current = 4000;
+
+            const rawResult: string = data.result || '';
+            if (!rawResult || rawResult.toLowerCase().includes('nothing clear')) {
+                setDetectedObjects([]);
+                return;
+            }
+
+            // Parse JSON — strip any markdown code fences if present
+            let jsonStr = rawResult.trim();
+            const fenceMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+            if (fenceMatch) jsonStr = fenceMatch[1].trim();
+
+            // Find the first '[' in case there's prefix text
+            const arrayStart = jsonStr.indexOf('[');
+            if (arrayStart > 0) jsonStr = jsonStr.slice(arrayStart);
+
+            let items: any[] = [];
             try {
-                const sampleData = ctx.getImageData(startX, startY, boxWidth, boxHeight);
-                const pixels = sampleData.data;
-                let sumLuma = 0;
-                let sumLumaSq = 0;
-                let pixelCount = 0;
-
-                // Check every 4th pixel to make it faster
-                for (let i = 0; i < pixels.length; i += 16) {
-                    const r = pixels[i];
-                    const g = pixels[i + 1];
-                    const b = pixels[i + 2];
-                    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-                    sumLuma += luma;
-                    sumLumaSq += luma * luma;
-                    pixelCount++;
-                }
-
-                if (pixelCount > 0) {
-                    const meanLuma = sumLuma / pixelCount;
-                    const variance = (sumLumaSq / pixelCount) - (meanLuma * meanLuma);
-
-                    // If the area is extremely uniform (low variance), we guess there's a flat wall close by
-                    // Tightened threshold to 600 to prevent false positive walls on noisy surfaces
-                    if (variance < 600) {
-                        // Adjust step calculation to be more aggressive when variance is low
-                        const estimatedSteps = Math.max(1, Math.floor(variance / 60));
-
-                        // Need to scale the bbox back to the original video dimensions for consistency
-                        wallPrediction = {
-                            class: 'wall',
-                            score: 0.85,
-                            bbox: [0, Math.floor(startY / scale), video.videoWidth, Math.floor((drawHeight - startY) / scale)],
-                            estimatedDistanceMeters: estimatedSteps * 0.76,
-                            estimatedSteps: estimatedSteps,
-                            position: "center"
-                        };
-                    }
-                }
-            } catch (err) {
-                console.error("Variance check failed", err)
+                items = JSON.parse(jsonStr);
+            } catch (e) {
+                console.warn('[SCAN] Failed to parse JSON:', e, jsonStr.substring(0, 200));
+                return;
             }
 
-            // AI Vision Object Detection via Gemini Proxy (Async background task)
-            if (!isGeminiProcessingRef.current) {
-                console.log("[SCAN] Starting new Gemini request...");
-                isGeminiProcessingRef.current = true;
-                const backendUrl = `/api/describe`;
-                const base64Image = canvas.toDataURL('image/jpeg', 0.6); // Reduced quality for speed
-
-                let hasRateLimitError = false;
-
-                fetch(backendUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image: base64Image, mode: 'detect' })
-                })
-                    .then(response => {
-                        console.log("[SCAN] Received response status:", response.status);
-                        if (response.status === 429) {
-                            hasRateLimitError = true;
-                        }
-                        return response.json();
-                    })
-                    .then(data => {
-                        if (data.error) {
-                            console.warn("AI Backend Error:", data.error, data.details);
-                            const errorStr = String(data.error).toLowerCase();
-                            const detailsStr = String(data.details).toLowerCase();
-
-                            if (errorStr.includes("quota") || detailsStr.includes("quota") ||
-                                errorStr.includes("429") || detailsStr.includes("429") ||
-                                errorStr.includes("rate limit") || hasRateLimitError) {
-                                hasRateLimitError = true;
-                                if (now - lastSpokeRateLimitRef.current > 60000) {
-                                    // Removed voice alert for wait limit exceeded per user request
-                                    lastSpokeRateLimitRef.current = now;
-                                }
-                            }
-
-                            // Clear predictions so the UI doesn't freeze with stale boxes
-                            latestGeminiPredictionsRef.current = [];
-                            return; // Stop processing if backend returned an error
-                        }
-
-                        const rawResult = data.result || "";
-                        console.log("[SCAN] Raw AI Result:", rawResult.substring(0, 100) + "...");
-
-                        if (rawResult && rawResult !== "Nothing clear detected." && !rawResult.includes("Error")) {
-                            try {
-                                // Extract JSON if wrapped in markdown
-                                let jsonStr = rawResult;
-                                const match = rawResult.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-                                if (match) {
-                                    jsonStr = match[1];
-                                }
-
-                                const items = JSON.parse(jsonStr);
-                                console.log("[SCAN] Parsed AI Items:", items.length);
-
-                                if (Array.isArray(items)) {
-                                    latestGeminiPredictionsRef.current = items.map((item: any) => {
-                                        // item.bbox is [ymin, xmin, ymax, xmax] normalized 0 to 1000
-                                        const ymin = (item.bbox[0] / 1000) * video.videoHeight;
-                                        const xmin = (item.bbox[1] / 1000) * video.videoWidth;
-                                        const ymax = (item.bbox[2] / 1000) * video.videoHeight;
-                                        const xmax = (item.bbox[3] / 1000) * video.videoWidth;
-
-                                        return {
-                                            class: item.class ? item.class.toLowerCase() : 'unknown',
-                                            score: item.score || 0.9,
-                                            bbox: [xmin, ymin, xmax - xmin, ymax - ymin]
-                                        };
-                                    });
-                                }
-                            } catch (e) {
-                                console.warn("Failed to parse Gemini detect JSON:", e, rawResult);
-                            }
-                        }
-                    })
-                    .catch(backendErr => {
-                        // Keep error silently logged as string to avoid Next.js dev overlay intercepting the Error object
-                        const errorString = String(backendErr);
-                        console.warn("AI Vision request failed:", errorString);
-                        // Do not lock onto old predictions if the API is failing
-                        latestGeminiPredictionsRef.current = [];
-                        hasRateLimitError = true;
-                    })
-                    .finally(() => {
-                        // Use a much longer timeout if we hit a rate limit to allow the quota to reset
-                        const delayMs = hasRateLimitError ? 30000 : 6000;
-                        console.log(`[SCAN] Request finished. Waiting ${delayMs / 1000}s before next allowed scan.`);
-
-                        setTimeout(() => {
-                            console.log("[SCAN] Ready for next scan.");
-                            isGeminiProcessingRef.current = false;
-                        }, delayMs);
-                    });
+            if (!Array.isArray(items) || items.length === 0) {
+                setDetectedObjects([]);
+                return;
             }
 
-            // Always use the latest available predictions for the frame processing
-            let predictions: any[] = [];
-            if (Array.isArray(latestGeminiPredictionsRef.current)) {
-                predictions = [...latestGeminiPredictionsRef.current];
-            }
+            const video = videoRef.current;
+            if (!video) return;
 
-            // Estimate distances (Since we synthesize boxes, we rely heavily on the wall heuristic or default sizes)
-            const AVERAGE_HEIGHTS: Record<string, number> = {
-                person: 1.7, man: 1.7, woman: 1.6, boy: 1.4, girl: 1.3, human: 1.6,
-                chair: 0.9, table: 0.8, desk: 0.8, 'wooden table': 0.8,
-                sofa: 0.9, couch: 0.9, bed: 0.6, door: 2.0, window: 1.5,
-                laptop: 0.2, computer: 0.4, monitor: 0.4, tv: 0.6, television: 0.6,
-                speaker: 0.3, socket: 0.1, 'power socket': 0.1, switch: 0.1,
-                phone: 0.15, 'cell phone': 0.15, mobile: 0.15,
-                cup: 0.1, bottle: 0.25, glass: 0.15, mug: 0.1,
-                car: 1.5, truck: 3.5, bus: 3.0, motorcycle: 1.2, bicycle: 1.0,
-                tree: 3.0, plant: 0.5, 'potted plant': 0.5, bush: 1.0,
-                bag: 0.5, backpack: 0.5, suitcase: 0.6, box: 0.4,
-                cat: 0.3, dog: 0.6, pet: 0.4,
-                wall: 2.5, floor: 0.0, ceiling: 3.0
-            };
-
-            // Standard mobile camera focal length approximation (often ~0.8 to 1.0 depending on field of view)
-            // A more standard 60-degree vertical FOV gives f = height / (2 * tan(30deg)) = height / 1.15
             const focalLength = video.videoHeight / 1.15;
 
-            const enhancedPredictions = predictions.map((pred: any) => {
-                if (!pred || !pred.bbox || pred.bbox.length !== 4) return null; // Safe check for malformed bbox array
+            const enhanced: DetectedObject[] = items
+                .filter((item: any) => item && item.class && Array.isArray(item.bbox) && item.bbox.length === 4)
+                .map((item: any) => {
+                    const label = String(item.class).toLowerCase();
 
-                const [x, , width, height] = pred.bbox;
+                    // Skip lights/ceiling items
+                    if (/light|lamp|bulb|ceiling|fixture/i.test(label)) return null;
 
-                // Try to find a matching height key, or default to 0.4m (typical small object)
-                let realHeight = 0.4;
-                for (const key in AVERAGE_HEIGHTS) {
-                    if (pred.class.includes(key)) {
-                        realHeight = AVERAGE_HEIGHTS[key];
-                        break;
+                    // bbox from API: [ymin, xmin, ymax, xmax] normalized 0-1000
+                    const ymin = (item.bbox[0] / 1000) * video.videoHeight;
+                    const xmin = (item.bbox[1] / 1000) * video.videoWidth;
+                    const ymax = (item.bbox[2] / 1000) * video.videoHeight;
+                    const xmax = (item.bbox[3] / 1000) * video.videoWidth;
+
+                    const bboxWidth = xmax - xmin;
+                    const bboxHeight = ymax - ymin;
+
+                    // Estimate distance
+                    let realHeight = 0.4;
+                    for (const key in AVERAGE_HEIGHTS) {
+                        if (label.includes(key)) { realHeight = AVERAGE_HEIGHTS[key]; break; }
                     }
-                }
 
-                // Distance = (Real Height * Focal Length) / Pixel Height
-                const estimatedDistanceMeters = (realHeight * focalLength) / height;
+                    const distanceM = bboxHeight > 0 ? (realHeight * focalLength) / bboxHeight : 99;
+                    let rawSteps = Math.min(30, Math.max(1, Math.round(distanceM / 0.762)));
 
-                // 1 step is approximately 0.762 meters (30 inches)
-                let rawSteps = Math.max(1, Math.round(estimatedDistanceMeters / 0.762));
-                rawSteps = Math.min(rawSteps, 30);
+                    if (!distanceHistoryRef.current[label]) distanceHistoryRef.current[label] = [];
+                    const history = distanceHistoryRef.current[label];
+                    history.push(rawSteps);
+                    if (history.length > 3) history.shift();
+                    const smoothedSteps = Math.round(history.reduce((a, b) => a + b, 0) / history.length);
 
-                if (!distanceHistoryRef.current[pred.class]) {
-                    distanceHistoryRef.current[pred.class] = [];
-                }
+                    const centerX = xmin + bboxWidth / 2;
+                    let position: "left" | "right" | "center" = "center";
+                    if (centerX < video.videoWidth / 3) position = "left";
+                    else if (centerX > video.videoWidth * (2 / 3)) position = "right";
 
-                const history = distanceHistoryRef.current[pred.class];
-                history.push(rawSteps);
-                if (history.length > 3) {
-                    history.shift();
-                }
+                    return {
+                        class: label,
+                        score: item.score ?? 0.85,
+                        bbox: [xmin, ymin, bboxWidth, bboxHeight] as [number, number, number, number],
+                        position,
+                        estimatedDistanceMeters: smoothedSteps * 0.76,
+                        estimatedSteps: smoothedSteps,
+                    };
+                })
+                .filter(Boolean) as DetectedObject[];
 
-                const smoothedSteps = Math.round(history.reduce((a, b) => a + b, 0) / history.length);
+            console.log(`[SCAN] Detected ${enhanced.length} objects`);
+            setDetectedObjects(enhanced);
 
-                const centerX = x + (width / 2);
-                let position: "left" | "right" | "center" = "center";
-                if (centerX < video.videoWidth / 3) {
-                    position = "left"; // If it's on the left side of the screen/camera, it's left from the user's perspective
-                } else if (centerX > video.videoWidth * (2 / 3)) {
-                    position = "right"; // If it's on the right side of the screen/camera, it's right
-                }
-
-                return {
-                    ...pred,
-                    estimatedDistanceMeters: smoothedSteps * 0.76,
-                    estimatedSteps: smoothedSteps,
-                    position
-                };
-            }).filter((pred: any) => {
-                if (!pred) return false;
-                const lowerClass = pred.class.toLowerCase();
-                // Ignore lights and ceilings
-                if (lowerClass.includes('light') || lowerClass.includes('lamp') || lowerClass.includes('bulb') || lowerClass.includes('ceiling')) {
-                    return false;
-                }
-                return true;
-            }); // Filter out any nulls or lights
-
-            if (wallPrediction) {
-                if (enhancedPredictions.length < 5) {
-                    enhancedPredictions.push(wallPrediction);
-                }
+            if (onDetectRef.current && enhanced.length > 0) {
+                onDetectRef.current(enhanced);
             }
 
-            setDetectedObjects(enhancedPredictions);
-
-            if (onDetectRef.current && enhancedPredictions.length > 0) {
-                onDetectRef.current(enhancedPredictions);
-            }
-        } catch (error) {
-            console.error('Error in object detection loop:', error);
+        } catch (err) {
+            console.error('[SCAN] Fetch error:', String(err));
+            nextCallDelayMs.current = 6000;
         } finally {
-            // Fast loop reset. Gemini API rate limiting is handled by isGeminiProcessingRef.
-            isProcessingRef.current = false;
+            isRequestInFlightRef.current = false;
         }
-    }, [isNavigating, videoRef]);
+    }, [isNavigating, captureFrameBase64, videoRef]);
 
     useEffect(() => {
         if (!isNavigating) {
             setDetectedObjects([]);
-            latestGeminiPredictionsRef.current = [];
-            isGeminiProcessingRef.current = false;
+            isRequestInFlightRef.current = false;
+            nextCallDelayMs.current = 4000;
+            lastCallTimeRef.current = 0;
             return;
         }
 
-        // Use a shorter interval (e.g. 250ms or 500ms) but it will skip if isProcessing is true
-        const intervalId = setInterval(() => {
-            processFrame();
-        }, invokeIntervalMs);
-
-        return () => clearInterval(intervalId);
-    }, [isNavigating, invokeIntervalMs, processFrame]);
+        // Poll rapidly; the time-gating inside runDetection controls actual API call frequency
+        const id = setInterval(runDetection, invokeIntervalMs);
+        return () => clearInterval(id);
+    }, [isNavigating, invokeIntervalMs, runDetection]);
 
     return { detectedObjects };
 }
