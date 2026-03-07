@@ -26,8 +26,8 @@ let model = null;
  */
 async function loadModel() {
   if (!model) {
-    console.log("[BACKEND] Loading COCO-SSD model...");
-    model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+    console.log("[BACKEND] Loading COCO-SSD model (mobilenet_v2 for max accuracy)...");
+    model = await cocoSsd.load({ base: "mobilenet_v2" });
     console.log("[BACKEND] COCO-SSD model loaded successfully.");
   }
   return model;

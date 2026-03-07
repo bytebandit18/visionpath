@@ -125,16 +125,16 @@ const BackgroundCameraInner = forwardRef<BackgroundCameraHandle, BackgroundCamer
     const { detectedObjects } = useObjectDetection({
         isNavigating,
         videoRef,
-        invokeIntervalMs: 1000,
+        invokeIntervalMs: 500,
         onDescribeScene: (description: string) => {
             speak(`Scene: ${description}`, "polite");
         },
         onDetect: (objects: any[]) => {
             const now = Date.now()
 
-            // Prune stale entries older than 60 seconds to prevent memory growth
+            // Prune stale entries older than 30 seconds to prevent memory growth but allow normal repeating
             for (const key in lastSpokenRef.current) {
-                if (now - lastSpokenRef.current[key] > 60000) {
+                if (now - lastSpokenRef.current[key] > 30000) {
                     delete lastSpokenRef.current[key]
                 }
             }
@@ -155,7 +155,7 @@ const BackgroundCameraInner = forwardRef<BackgroundCameraHandle, BackgroundCamer
             })
 
             const sortedGroups = Object.values(groups).sort((a, b) => a.closestSteps - b.closestSteps)
-            const hazards = ['car', 'truck', 'bus', 'motorcycle', 'wall']
+            const hazards = ['car', 'truck', 'bus', 'motorcycle', 'door']
 
             sortedGroups.forEach((group) => {
                 const { count, closestSteps, latestObj } = group
@@ -163,18 +163,14 @@ const BackgroundCameraInner = forwardRef<BackgroundCameraHandle, BackgroundCamer
                 const isHazard = hazards.includes(objClass)
                 const lastSpoken = lastSpokenRef.current[objClass] || 0
 
-                let cooldownMs = 12000;
+                let cooldownMs = 6000;
                 if (isHazard) {
-                    if (objClass === 'wall') {
-                        cooldownMs = closestSteps < 5 ? 3000 : 10000;
-                    } else {
-                        cooldownMs = closestSteps < 15 ? 4000 : 8000;
-                    }
+                    cooldownMs = closestSteps < 10 ? 3000 : 5000;
                 }
 
                 if (now - lastSpoken > cooldownMs) {
                     const distanceStr = closestSteps < 99 ? `${closestSteps} steps` : "ahead"
-                    const countStr = count > 1 && objClass !== 'wall' ? `${count} ${objClass}s` : objClass
+                    const countStr = count > 1 ? `${count} ${objClass}s` : objClass
                     const hazardPrefix = isHazard ? "Caution, " : ""
                     let positionStr = "ahead";
                     if (latestObj.position === "left") positionStr = "on your left";

@@ -42,7 +42,7 @@ export function useObjectDetection({
     // Request gate — only one API call in-flight at a time
     const isRequestInFlightRef = useRef(false);
     // How long to wait before next call (increases on rate limit)
-    const nextCallDelayMs = useRef(4000);
+    const nextCallDelayMs = useRef(500);
     const lastCallTimeRef = useRef(0);
 
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -66,8 +66,8 @@ export function useObjectDetection({
         const canvas = canvasRef.current;
         if (!canvas) return null;
 
-        // Scale down for faster encoding and lower API payload
-        const scale = Math.min(1, 480 / Math.max(video.videoWidth, video.videoHeight));
+        // Scale down for faster encoding, but keep it high enough for accurate detection
+        const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
         canvas.width = Math.floor(video.videoWidth * scale);
         canvas.height = Math.floor(video.videoHeight * scale);
 
@@ -75,7 +75,7 @@ export function useObjectDetection({
         if (!ctx) return null;
 
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        return canvas.toDataURL('image/jpeg', 0.7);
+        return canvas.toDataURL('image/jpeg', 0.85);
     }, [videoRef]);
 
     const runDetection = useCallback(async () => {
@@ -112,7 +112,7 @@ export function useObjectDetection({
             const data = await res.json();
 
             // Reset delay on success
-            nextCallDelayMs.current = 4000;
+            nextCallDelayMs.current = 500;
 
             const items: any[] = data.objects || [];
             if (items.length === 0) {
@@ -191,7 +191,7 @@ export function useObjectDetection({
         if (!isNavigating) {
             setDetectedObjects([]);
             isRequestInFlightRef.current = false;
-            nextCallDelayMs.current = 4000;
+            nextCallDelayMs.current = 500;
             lastCallTimeRef.current = 0;
             distanceHistoryRef.current = {};
             return;
