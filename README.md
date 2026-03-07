@@ -1,5 +1,9 @@
 Vision Path: Eyes-Free Indoor Navigation
 Vision Path is a revolutionary, infrastructure-independent indoor navigation system designed for zero-visibility environments. Developed by team VitalCoders from the Heritage Institute of Technology, Kolkata, this project leverages smartphone sensor fusion and spatial audio to guide users safely when GPS, maps, and visual cues fail.
+
+## 🎥 Demo
+
+https://github.com/bytebandit18/visionpath/raw/main/public/demo-video.mp4
 +4
 
 🚀 The Core Innovation
